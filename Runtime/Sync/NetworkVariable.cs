@@ -108,6 +108,19 @@ namespace RTMPE.Sync
         public void MarkClean() => IsDirty = false;
 
         /// <summary>
+        /// Force the dirty flag to <see langword="true"/> without changing the
+        /// stored value.  Used by the SDK when a late joiner enters the room
+        /// and needs a full state snapshot — every variable on every owned
+        /// object is re-flagged so the next 30 Hz flush retransmits its
+        /// current value.
+        /// <para>
+        /// Does NOT fire <c>OnValueChanged</c> — the value is unchanged; only
+        /// the send-queue state is reset.  Safe to call multiple times.
+        /// </para>
+        /// </summary>
+        internal void MarkDirtyForResync() => IsDirty = true;
+
+        /// <summary>
         /// Write the current value to <paramref name="writer"/> in a format
         /// that can be recovered by <see cref="Deserialize"/>.
         /// Value bytes only — the variable ID is NOT included.
@@ -129,32 +142,64 @@ namespace RTMPE.Sync
             // Write var_id first.
             writer.Write(VariableId);
 
-            // Write a 2-byte LE length prefix for the value payload.
-            // This lets the receiver skip entries with unknown variable IDs
-            // instead of stopping mid-packet and losing all subsequent variables.
+            // Write a 2-byte LE length prefix for the value payload.  The
+            // prefix lets the receiver skip entries with unknown variable
+            // IDs instead of stopping mid-packet and losing all subsequent
+            // variables.
             //
-            // A growable MemoryStream is required here — a fixed-size buffer backed
-            // by ArrayPool is NOT safe.  NetworkVariableString.Serialize() emits
-            // up to 65,537 bytes (2-byte LE prefix + up to 65,535 UTF-8 content
-            // bytes).  Passing that to a non-resizable MemoryStream backed by a
-            // 64-byte slice throws NotSupportedException: Memory stream is not
-            // expandable.  The growable form starts at InitialCapacity (covering all
-            // struct types without reallocation) and grows lazily only when needed.
-            const int InitialCapacity = 64; // sufficient for all struct types (Quaternion = 16 B)
-            using var ms = new MemoryStream(InitialCapacity);
-            using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+            // Fast path: rent a pool-backed byte[] large enough for every
+            // struct value (Quaternion = 16 B) and most strings.  This is
+            // zero-heap for the common case (30 Hz × N objects × M vars).
+            //
+            // Slow path: NetworkVariableString may emit up to 65,537 bytes.
+            // Writing past the rented buffer throws NotSupportedException on
+            // a non-growable MemoryStream; we detect this and fall through
+            // to a growable stream.  The slow path executes only for the
+            // long-string edge case — ≈ 0 % of gameplay traffic.
+            const int PoolBufferSize = 1024;
+            var pool = System.Buffers.ArrayPool<byte>.Shared;
+            byte[] rented = pool.Rent(PoolBufferSize);
+            bool overflowed = false;
+            try
+            {
+                using var fast = new MemoryStream(rented, 0, rented.Length, writable: true);
+                using var bw = new BinaryWriter(fast, Encoding.UTF8, leaveOpen: true);
+                try
+                {
+                    Serialize(bw);
+                    bw.Flush();
+                }
+                catch (NotSupportedException)
+                {
+                    // Rented buffer is too small — the growable fallback
+                    // below will be used instead.
+                    overflowed = true;
+                }
+
+                if (!overflowed)
+                {
+                    int valueLen = (int)fast.Position;
+                    writer.Write((ushort)valueLen);
+                    writer.Write(rented, 0, valueLen);
+                    return;
+                }
+            }
+            finally
+            {
+                pool.Return(rented);
+            }
+
+            // Slow path: allocate a growable stream.  Matches the pre-pool
+            // behaviour for NetworkVariableString and similarly large values.
+            using (var growable = new MemoryStream(PoolBufferSize))
+            using (var bw = new BinaryWriter(growable, Encoding.UTF8, leaveOpen: true))
             {
                 Serialize(bw);
                 bw.Flush();
+                int valueLen = (int)growable.Length;
+                writer.Write((ushort)valueLen);
+                writer.Write(growable.GetBuffer(), 0, valueLen);
             }
-
-            int valueLen = (int)ms.Length;
-
-            // [value_len:2 LE] — BinaryWriter.Write(ushort) is little-endian per spec.
-            writer.Write((ushort)valueLen);
-            // [value_bytes:N] — GetBuffer() is zero-copy (returns the raw internal array).
-            // Passing explicit 0..valueLen avoids writing trailing uninitialised bytes.
-            writer.Write(ms.GetBuffer(), 0, valueLen);
         }
 
         /// <summary>
@@ -355,20 +400,29 @@ namespace RTMPE.Sync
         // ── Serialisation ──────────────────────────────────────────────────────
 
         /// <inheritdoc/>
+        /// <exception cref="ArgumentException">
+        /// Thrown when the encoded UTF-8 length exceeds the wire-format cap of
+        /// <see cref="ushort.MaxValue"/> bytes.  Previously this case was
+        /// silently truncated with only a Debug.LogWarning, causing the client
+        /// and server to diverge on any long string — the caller had no signal
+        /// to react.  The fix-forward for a long payload is to either shorten
+        /// the string, split it across multiple NetworkVariables, or move
+        /// bulk data to an out-of-band channel (RPC with large payload).
+        /// </exception>
         public override void Serialize(BinaryWriter writer)
         {
             // Encode as a 2-byte LE uint16 length prefix followed by raw UTF-8
-            // bytes. This is wire-compatible with the Go server (binary.LittleEndian.Uint16).
-            // BinaryWriter.Write(string) emits a .NET 7-bit variable-length integer
-            // prefix which is not compatible with the Go wire format.
-            // Strings longer than 65535 UTF-8 bytes are clamped with a warning.
+            // bytes.  Wire-compatible with the Go server (binary.LittleEndian.Uint16).
+            // `BinaryWriter.Write(string)` would emit a .NET 7-bit variable-length
+            // integer prefix which is NOT compatible with the Go wire format.
             byte[] bytes = Encoding.UTF8.GetBytes(_value ?? string.Empty);
             if (bytes.Length > ushort.MaxValue)
             {
-                Debug.LogWarning(
-                    $"[RTMPE] NetworkVariableString: value exceeds {ushort.MaxValue} UTF-8 bytes " +
-                    "and will be truncated. Shorten the string.");
-                bytes = bytes[..ushort.MaxValue];
+                throw new ArgumentException(
+                    $"NetworkVariableString value is {bytes.Length} UTF-8 bytes, " +
+                    $"which exceeds the wire-format maximum of {ushort.MaxValue}.  " +
+                    "Shorten the string, split across multiple variables, or use an RPC for bulk data.",
+                    nameof(_value));
             }
 
             // 2-byte LE length prefix (compatible with Go binary.LittleEndian.Uint16).

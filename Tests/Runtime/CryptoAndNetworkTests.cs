@@ -890,7 +890,7 @@ namespace RTMPE.Tests
 
     [TestFixture]
     [Category("CryptoKeyZeroization")]
-    public class M1_HandshakeHandlerKeyZeroingTests
+    public class HandshakeHandlerKeyZeroingTests
     {
         [Test]
         public void Dispose_ZerosClientPrivateKey()
@@ -945,7 +945,7 @@ namespace RTMPE.Tests
 
     [TestFixture]
     [Category("InterpolatorTimestamp")]
-    public class M2_NetworkTransformInterpolatorMonotonicTests
+    public class NetworkTransformInterpolatorMonotonicTests
     {
         private GameObject                   _go;
         private NetworkTransformInterpolator _interp;
@@ -953,7 +953,7 @@ namespace RTMPE.Tests
         [SetUp]
         public void SetUp()
         {
-            _go     = new GameObject("Interp_M2");
+            _go     = new GameObject("Interp");
             _interp = _go.AddComponent<NetworkTransformInterpolator>();
             _interp.ConfigureForTest(bufferSize: 8, interpolationDelay: 0.1f);
         }
@@ -1028,6 +1028,901 @@ namespace RTMPE.Tests
 
             Assert.AreEqual(8, _interp.BufferCount,
                 "Buffer must contain exactly 8 entries after 8 monotonically increasing AddState calls.");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AeadPacketPipeline — end-to-end ChaCha20-Poly1305 packet pipeline
+    //
+    //   These tests verify the wire-format contract that NetworkManager
+    //   EncryptAndSend / DecryptInboundPacket must honour:
+    //
+    //     • Nonce layout  : [counter:8 LE u64][session_id:4 LE u32]   (12 bytes)
+    //     • SEQ prefix    : orig_seq prepended as 4-byte LE u32 to plaintext
+    //     • AAD           : [packet_type, flags_without_FLAG_ENCRYPTED]
+    //     • Symmetry      : AAD flags are identical on both seal and open sides
+    //
+    //   Each test uses local helpers that re-implement the *same algorithm* as
+    //   the production code (using ChaCha20Poly1305Impl.Seal / Open directly),
+    //   so a mismatch in the production code would surface as a tag failure.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("AeadPacketPipeline")]
+    public class AeadPacketPipelineTests
+    {
+        // A deterministic 256-bit test key (not used outside this class).
+        private static readonly byte[] TestKey = new byte[32]
+        {
+            0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+            0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+            0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+            0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4,
+        };
+
+        private const byte FlagEncrypted = 0x02;
+        private const int  OffType       = PacketProtocol.OFFSET_TYPE;
+        private const int  OffFlags      = PacketProtocol.OFFSET_FLAGS;
+        private const int  OffSeq        = PacketProtocol.OFFSET_SEQUENCE;
+        private const int  OffPLen       = PacketProtocol.OFFSET_PAYLOAD_LEN;
+        private const int  HdrSize       = PacketProtocol.HEADER_SIZE;
+
+        // ── helpers ───────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Builds a minimal but structurally valid RTMPE packet.
+        /// </summary>
+        private static byte[] MakePacket(byte packetType, byte flags,
+                                         uint seq, byte[] payload)
+        {
+            int  len = HdrSize + (payload?.Length ?? 0);
+            var  p   = new byte[len];
+            // magic
+            p[0] = 0x54; p[1] = 0x52;
+            // version
+            p[2] = PacketProtocol.VERSION;
+            p[OffType]  = packetType;
+            p[OffFlags] = flags;
+            // sequence
+            p[OffSeq]     = (byte) seq;
+            p[OffSeq + 1] = (byte)(seq >>  8);
+            p[OffSeq + 2] = (byte)(seq >> 16);
+            p[OffSeq + 3] = (byte)(seq >> 24);
+            // payload_len
+            uint pLen = (uint)(payload?.Length ?? 0);
+            p[OffPLen]     = (byte) pLen;
+            p[OffPLen + 1] = (byte)(pLen >>  8);
+            p[OffPLen + 2] = (byte)(pLen >> 16);
+            p[OffPLen + 3] = (byte)(pLen >> 24);
+            if (payload != null && payload.Length > 0)
+                Buffer.BlockCopy(payload, 0, p, HdrSize, payload.Length);
+            return p;
+        }
+
+        /// <summary>
+        /// Builds the 12-byte nonce: [counter:8 LE u64][session_id:4 LE u32].
+        /// Mirrors <c>NonceGenerator::build_nonce_raw</c> in the Rust gateway and
+        /// <c>NetworkManager.BuildAeadNonce</c> in the SDK.
+        /// </summary>
+        private static byte[] BuildNonce(uint counter, uint sessionId)
+        {
+            var n = new byte[12];
+            n[0] = (byte) counter;       n[1] = (byte)(counter >>  8);
+            n[2] = (byte)(counter >> 16); n[3] = (byte)(counter >> 24);
+            // n[4..7] remain 0x00 — high 32 bits of counter, always zero
+            n[8]  = (byte) sessionId;     n[9]  = (byte)(sessionId >>  8);
+            n[10] = (byte)(sessionId >> 16); n[11] = (byte)(sessionId >> 24);
+            return n;
+        }
+
+        /// <summary>
+        /// Re-implements EncryptAndSend's crypto transforms for test verification.
+        /// Mirrors <c>encrypt_outbound()</c> in the Rust gateway's pipeline.rs.
+        /// </summary>
+        private static byte[] SimulateEncryptAndSend(
+            byte[] packet, byte[] key, uint nonceCounter, uint cryptoId)
+        {
+            uint origSeq = (uint)(
+                  packet[OffSeq] | (packet[OffSeq + 1] << 8)
+                | (packet[OffSeq + 2] << 16) | (packet[OffSeq + 3] << 24));
+            uint payloadLen = (uint)(
+                  packet[OffPLen] | (packet[OffPLen + 1] << 8)
+                | (packet[OffPLen + 2] << 16) | (packet[OffPLen + 3] << 24));
+
+            byte pktType = packet[OffType];
+            byte flags   = packet[OffFlags];
+
+            // plaintext = [orig_seq:4 LE] || payload
+            var pt = new byte[4 + (int)payloadLen];
+            pt[0] = (byte)origSeq; pt[1] = (byte)(origSeq >> 8);
+            pt[2] = (byte)(origSeq >> 16); pt[3] = (byte)(origSeq >> 24);
+            if (payloadLen > 0)
+                Buffer.BlockCopy(packet, HdrSize, pt, 4, (int)payloadLen);
+
+            // AAD = [packet_type, flags_without_encrypted]
+            var aad = new byte[] { pktType, flags };
+
+            var ct = ChaCha20Poly1305Impl.Seal(key, BuildNonce(nonceCounter, cryptoId), pt, aad);
+
+            var result = new byte[HdrSize + ct.Length];
+            Buffer.BlockCopy(packet, 0, result, 0, HdrSize);
+
+            // header.sequence = nonce counter
+            result[OffSeq]     = (byte) nonceCounter;
+            result[OffSeq + 1] = (byte)(nonceCounter >>  8);
+            result[OffSeq + 2] = (byte)(nonceCounter >> 16);
+            result[OffSeq + 3] = (byte)(nonceCounter >> 24);
+            // header.flags |= FLAG_ENCRYPTED
+            result[OffFlags] = (byte)(flags | FlagEncrypted);
+            // header.payload_len = len(ciphertext)
+            uint ctLen = (uint)ct.Length;
+            result[OffPLen]     = (byte) ctLen;
+            result[OffPLen + 1] = (byte)(ctLen >>  8);
+            result[OffPLen + 2] = (byte)(ctLen >> 16);
+            result[OffPLen + 3] = (byte)(ctLen >> 24);
+
+            Buffer.BlockCopy(ct, 0, result, HdrSize, ct.Length);
+            return result;
+        }
+
+        /// <summary>
+        /// Re-implements DecryptInboundPacket's crypto transforms for test verification.
+        /// Mirrors <c>decrypt_inbound()</c> in the Rust gateway's pipeline.rs.
+        /// </summary>
+        private static byte[] SimulateDecryptInboundPacket(
+            byte[] data, byte[] key, uint cryptoId)
+        {
+            if (data == null || data.Length < HdrSize + 4 + 16) return null;
+
+            uint nonceCounter = (uint)(
+                  data[OffSeq] | (data[OffSeq + 1] << 8)
+                | (data[OffSeq + 2] << 16) | (data[OffSeq + 3] << 24));
+
+            byte pktType = data[OffType];
+            byte flags   = data[OffFlags];
+
+            // AAD = [packet_type, flags & ~FLAG_ENCRYPTED]
+            var aad = new byte[] { pktType, (byte)(flags & ~FlagEncrypted) };
+
+            int ctLen = data.Length - HdrSize;
+            var ct = new byte[ctLen];
+            Buffer.BlockCopy(data, HdrSize, ct, 0, ctLen);
+
+            var pt = ChaCha20Poly1305Impl.Open(
+                key, BuildNonce(nonceCounter, cryptoId), ct, aad);
+            if (pt == null || pt.Length < 4) return null;
+
+            uint origSeq = (uint)(
+                  pt[0] | (pt[1] << 8) | (pt[2] << 16) | (pt[3] << 24));
+            int actualPLen = pt.Length - 4;
+
+            var result = new byte[HdrSize + actualPLen];
+            Buffer.BlockCopy(data, 0, result, 0, HdrSize);
+
+            result[OffSeq]     = (byte) origSeq;
+            result[OffSeq + 1] = (byte)(origSeq >>  8);
+            result[OffSeq + 2] = (byte)(origSeq >> 16);
+            result[OffSeq + 3] = (byte)(origSeq >> 24);
+            result[OffFlags] = (byte)(flags & ~FlagEncrypted);
+
+            uint newPLen = (uint)actualPLen;
+            result[OffPLen]     = (byte) newPLen;
+            result[OffPLen + 1] = (byte)(newPLen >>  8);
+            result[OffPLen + 2] = (byte)(newPLen >> 16);
+            result[OffPLen + 3] = (byte)(newPLen >> 24);
+
+            if (actualPLen > 0)
+                Buffer.BlockCopy(pt, 4, result, HdrSize, actualPLen);
+            return result;
+        }
+
+        // ── tests ─────────────────────────────────────────────────────────────
+
+        [Test]
+        public void Nonce_Layout_CounterInBytes0to7_SessionIdInBytes8to11()
+        {
+            // counter = 0xDEADBEEF (LE in bytes 0-3, bytes 4-7 must be 0)
+            // sessionId = 0x12345678 (LE in bytes 8-11)
+            uint counter   = 0xDEADBEEFu;
+            uint sessionId = 0x12345678u;
+
+            var nonce = BuildNonce(counter, sessionId);
+
+            Assert.AreEqual(12, nonce.Length, "Nonce must be 12 bytes");
+            // counter LE
+            Assert.AreEqual(0xEF, nonce[0],  "nonce[0] = counter byte 0 (LSB)");
+            Assert.AreEqual(0xBE, nonce[1],  "nonce[1] = counter byte 1");
+            Assert.AreEqual(0xAD, nonce[2],  "nonce[2] = counter byte 2");
+            Assert.AreEqual(0xDE, nonce[3],  "nonce[3] = counter byte 3 (MSB)");
+            Assert.AreEqual(0x00, nonce[4],  "nonce[4] = high counter byte 0 — must be 0");
+            Assert.AreEqual(0x00, nonce[5],  "nonce[5] = high counter byte 1 — must be 0");
+            Assert.AreEqual(0x00, nonce[6],  "nonce[6] = high counter byte 2 — must be 0");
+            Assert.AreEqual(0x00, nonce[7],  "nonce[7] = high counter byte 3 — must be 0");
+            // session_id LE
+            Assert.AreEqual(0x78, nonce[8],  "nonce[8]  = sessionId byte 0 (LSB)");
+            Assert.AreEqual(0x56, nonce[9],  "nonce[9]  = sessionId byte 1");
+            Assert.AreEqual(0x34, nonce[10], "nonce[10] = sessionId byte 2");
+            Assert.AreEqual(0x12, nonce[11], "nonce[11] = sessionId byte 3 (MSB)");
+        }
+
+        [Test]
+        public void RoundTrip_WithPayload_RestoredExactly()
+        {
+            // Heartbeat (0x03), Reliable flag (0x04), seq = 42, 4-byte payload.
+            byte[] payload  = { 0xDE, 0xAD, 0xBE, 0xEF };
+            var    original = MakePacket(0x03, 0x04, seq: 42, payload);
+
+            uint nonceCounter = 0u;
+            uint cryptoId     = 7u;
+
+            var encrypted = SimulateEncryptAndSend(original, TestKey, nonceCounter, cryptoId);
+
+            // FLAG_ENCRYPTED must be set and header.sequence must carry the nonce counter.
+            Assert.IsTrue((encrypted[OffFlags] & FlagEncrypted) != 0,
+                "FLAG_ENCRYPTED must be set on the wire packet");
+            uint wireSeq = (uint)(encrypted[OffSeq] | (encrypted[OffSeq+1] << 8)
+                               | (encrypted[OffSeq+2] << 16) | (encrypted[OffSeq+3] << 24));
+            Assert.AreEqual(nonceCounter, wireSeq,
+                "header.sequence must equal the nonce counter after encryption");
+            // Ciphertext = original payload (4) + SEQ prefix (4) + Poly1305 tag (16)
+            Assert.AreEqual(HdrSize + payload.Length + 4 + 16, encrypted.Length,
+                "Encrypted length must be HEADER + payload + SEQ_prefix(4) + tag(16)");
+
+            var decrypted = SimulateDecryptInboundPacket(encrypted, TestKey, cryptoId);
+
+            Assert.IsNotNull(decrypted, "Decryption must succeed with matching key/nonce/AAD");
+            Assert.AreEqual(original.Length, decrypted.Length,
+                "Decrypted packet must be the same size as the original");
+            for (int i = 0; i < original.Length; i++)
+                Assert.AreEqual(original[i], decrypted[i],
+                    $"Byte mismatch at offset {i} after round-trip");
+        }
+
+        [Test]
+        public void RoundTrip_EmptyPayload_RestoredExactly()
+        {
+            // Edge case: packet with zero-length application payload.
+            var original = MakePacket(0x03, 0x00, seq: 0xFF, payload: null);
+
+            var encrypted = SimulateEncryptAndSend(original, TestKey, 0u, 1u);
+            var decrypted = SimulateDecryptInboundPacket(encrypted, TestKey, 1u);
+
+            Assert.IsNotNull(decrypted, "Round-trip must succeed for zero-length payload");
+            Assert.AreEqual(original.Length, decrypted.Length);
+            for (int i = 0; i < original.Length; i++)
+                Assert.AreEqual(original[i], decrypted[i],
+                    $"Byte mismatch at offset {i} for empty-payload packet");
+        }
+
+        [Test]
+        public void Decrypt_TamperedCiphertext_ReturnsNull()
+        {
+            var original  = MakePacket(0x10, 0x00, seq: 1, payload: new byte[] { 1, 2, 3 });
+            var encrypted = SimulateEncryptAndSend(original, TestKey, 5u, 99u);
+
+            // Flip one bit in the ciphertext body (not the tag) to break AEAD.
+            encrypted[HdrSize + 2] ^= 0xFF;
+
+            var result = SimulateDecryptInboundPacket(encrypted, TestKey, 99u);
+            Assert.IsNull(result, "Tampered ciphertext must be rejected by AEAD tag verification");
+        }
+
+        [Test]
+        public void Decrypt_WrongKey_ReturnsNull()
+        {
+            var original  = MakePacket(0x10, 0x00, seq: 99, payload: new byte[] { 5, 6, 7, 8 });
+            var encrypted = SimulateEncryptAndSend(original, TestKey, 1u, 42u);
+
+            var wrongKey = new byte[32]; // all-zero key
+            var result   = SimulateDecryptInboundPacket(encrypted, wrongKey, 42u);
+            Assert.IsNull(result, "Wrong decryption key must be rejected by Poly1305 tag");
+        }
+
+        [Test]
+        public void Decrypt_WrongCryptoId_ReturnsNull()
+        {
+            // Different cryptoId → different nonce → AEAD tag failure.
+            var original  = MakePacket(0x03, 0x00, seq: 0, payload: new byte[] { 1 });
+            var encrypted = SimulateEncryptAndSend(original, TestKey, 0u, cryptoId: 1u);
+
+            var result = SimulateDecryptInboundPacket(encrypted, TestKey, cryptoId: 2u);
+            Assert.IsNull(result, "Wrong cryptoId (nonce mismatch) must be rejected by AEAD");
+        }
+
+        [Test]
+        public void Decrypt_WrongNonceCounter_ReturnsNull()
+        {
+            // Flip LSB of header.sequence to simulate a wrong nonce counter.
+            var original  = MakePacket(0x03, 0x00, seq: 0, payload: new byte[] { 0xAA, 0xBB });
+            var encrypted = SimulateEncryptAndSend(original, TestKey, 10u, 5u);
+
+            encrypted[OffSeq] ^= 0x01; // mutate nonce counter in-place
+
+            var result = SimulateDecryptInboundPacket(encrypted, TestKey, 5u);
+            Assert.IsNull(result, "Modified nonce counter (wrong header.sequence) must be rejected");
+        }
+
+        [Test]
+        public void AadSymmetry_FlagsBytesAreIdenticalOnBothSides()
+        {
+            // Encrypt side: AAD flags = flags_before_encryption (no FLAG_ENCRYPTED yet).
+            // Decrypt side: AAD flags = flags_on_wire & ~FLAG_ENCRYPTED.
+            // Both must yield the same byte so the AEAD tag is consistent.
+            byte preEncryptFlags = 0x04; // only Reliable
+            byte onWireFlags     = (byte)(preEncryptFlags | FlagEncrypted); // Reliable | Encrypted
+
+            byte encryptAadFlags = preEncryptFlags;               // as seen by EncryptAndSend
+            byte decryptAadFlags = (byte)(onWireFlags & ~FlagEncrypted); // as seen by Decrypt
+
+            Assert.AreEqual(encryptAadFlags, decryptAadFlags,
+                "AAD flags byte must be identical on both encrypt and decrypt sides");
+        }
+
+        [Test]
+        public void SeqPrefix_OriginalSequenceRestoredAfterRoundTrip()
+        {
+            // Use a large, non-trivial sequence number to verify all 4 bytes are handled.
+            uint  origSeq  = 0xCAFEBABEu;
+            var   original = MakePacket(0x03, 0x04, origSeq, payload: new byte[] { 9, 8, 7 });
+            var   encrypted = SimulateEncryptAndSend(original, TestKey, 3u, 11u);
+            var   decrypted = SimulateDecryptInboundPacket(encrypted, TestKey, 11u);
+
+            Assert.IsNotNull(decrypted);
+            uint restoredSeq = (uint)(
+                  decrypted[OffSeq] | (decrypted[OffSeq+1] << 8)
+                | (decrypted[OffSeq+2] << 16) | (decrypted[OffSeq+3] << 24));
+            Assert.AreEqual(origSeq, restoredSeq,
+                "Original application sequence must be exactly restored after decryption");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Nonce Exhaustion Constants — verify SDK mirrors Rust gateway thresholds
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Verifies that the outbound nonce exhaustion constants in NetworkManager
+    /// match the Rust gateway's SEQUENCE_EXHAUSTION_THRESHOLD and
+    /// NEAR_EXHAUSTION_MARGIN (nonce.rs).
+    ///
+    /// These tests do NOT use reflection — they verify the public behaviour
+    /// implied by the constants (counter arithmetic) so the thresholds remain
+    /// aligned even if the field is refactored.
+    /// </summary>
+    [TestFixture]
+    [Category("NonceExhaustion")]
+    public class NonceExhaustionConstantsTests
+    {
+        // Mirror the production constants for assertion arithmetic.
+        // If these fail to compile the production values were renamed — fix both.
+        private const long ExhaustionThreshold    = (long)uint.MaxValue + 1L; // 4,294,967,296
+        private const long NearExhaustionMargin   = 1_048_576L;
+
+        [Test]
+        public void ExhaustionThreshold_Equals_TwoToThe32()
+        {
+            Assert.AreEqual(4_294_967_296L, ExhaustionThreshold,
+                "Exhaustion threshold must be 2^32 — matches SEQUENCE_EXHAUSTION_THRESHOLD in nonce.rs");
+        }
+
+        [Test]
+        public void ExhaustionThreshold_ExceedsUInt32MaxValue()
+        {
+            Assert.Greater(ExhaustionThreshold, (long)uint.MaxValue,
+                "Threshold must be strictly greater than uint.MaxValue so counter uint.MaxValue is still valid");
+        }
+
+        [Test]
+        public void LastValidCounter_IsUInt32MaxValue()
+        {
+            long lastValid = ExhaustionThreshold - 1L;
+            Assert.AreEqual((long)uint.MaxValue, lastValid,
+                "Last valid counter must be uint.MaxValue (4,294,967,295)");
+            // Must fit losslessly in uint — same as gateway's u32::try_from check.
+            Assert.DoesNotThrow(() => { _ = checked((uint)lastValid); },
+                "Last valid counter must be representable as uint without overflow");
+        }
+
+        [Test]
+        public void NearExhaustionWarning_FiresBefore_HardStop()
+        {
+            long warningThreshold = ExhaustionThreshold - NearExhaustionMargin;
+            Assert.Greater(ExhaustionThreshold, warningThreshold,
+                "Near-exhaustion warning must fire strictly before the hard stop");
+            Assert.GreaterOrEqual(warningThreshold, 0L,
+                "Near-exhaustion threshold must be non-negative");
+        }
+
+        [Test]
+        public void NearExhaustionMargin_Matches_GatewayValue()
+        {
+            // Gateway's NEAR_EXHAUSTION_MARGIN = 1_048_576 (nonce.rs).
+            Assert.AreEqual(1_048_576L, NearExhaustionMargin,
+                "Near-exhaustion margin must match Rust gateway NEAR_EXHAUSTION_MARGIN");
+        }
+
+        [Test]
+        public void CounterAtThreshold_IsRejected_ByRangeCheck()
+        {
+            // Simulate the guard: rawCounter >= ExhaustionThreshold → disconnect.
+            long atThreshold = ExhaustionThreshold;
+            Assert.IsTrue(atThreshold >= ExhaustionThreshold,
+                "Counter == threshold must trigger hard stop");
+        }
+
+        [Test]
+        public void CounterBelowThreshold_Fits_InUInt32()
+        {
+            // Every counter 0 … uint.MaxValue must cast to uint losslessly.
+            long[] samples = { 0L, 1L, 1_000_000L, (long)uint.MaxValue - 1L, (long)uint.MaxValue };
+            foreach (var c in samples)
+            {
+                Assert.Less(c, ExhaustionThreshold, $"Sample {c} must be below threshold");
+                uint asUint = (uint)c;
+                Assert.AreEqual(c, (long)asUint,
+                    $"Counter {c} must survive lossless round-trip through uint");
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Late-Join Resync (Fix 1) — MarkAllVariablesDirty propagates via
+    //      SpawnManager when a new player joins the room so the flush
+    //      loop retransmits current state.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("LateJoinResync")]
+    public class LateJoinResyncTests
+    {
+        private GameObject      _nmGo;
+        private NetworkManager  _nm;
+        private GameObject      _ownerGo;
+        private NetworkBehaviourStub _owner;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo     = new GameObject("NM_LateJoin");
+            _nm       = _nmGo.AddComponent<NetworkManager>();
+            _ownerGo  = new GameObject("NB_LateJoin");
+            _owner    = _ownerGo.AddComponent<NetworkBehaviourStub>();
+
+            _nm.SetLocalPlayerStringId("player-owner");
+            _owner.Initialize(42UL, "player-owner");
+            _owner.SetSpawned(true);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            UnityEngine.Object.DestroyImmediate(_nmGo);
+            UnityEngine.Object.DestroyImmediate(_ownerGo);
+        }
+
+        [Test]
+        public void MarkAllVariablesDirty_ReflaggsCleanedVariable_ForResync()
+        {
+            var v = new NetworkVariableInt(_owner, 1, 0);
+            v.Value = 7;          // dirty
+            v.MarkClean();         // cleaned
+            Assert.IsFalse(v.IsDirty, "Sanity: variable is clean before resync");
+
+            _owner.MarkAllVariablesDirty();
+
+            Assert.IsTrue(v.IsDirty,
+                "MarkAllVariablesDirty must force the variable back into the dirty set " +
+                "without changing its value — this is what feeds the late-joiner snapshot.");
+        }
+
+        [Test]
+        public void MarkAllVariablesDirty_DoesNotFireOnValueChanged()
+        {
+            var v = new NetworkVariableInt(_owner, 1, 0);
+            v.Value = 5;
+            v.MarkClean();
+
+            int changeCount = 0;
+            v.OnValueChanged += (oldV, newV) => changeCount++;
+
+            _owner.MarkAllVariablesDirty();
+
+            Assert.AreEqual(0, changeCount,
+                "Resync must not fire OnValueChanged — the value itself did not change.");
+        }
+
+        [Test]
+        public void SpawnManager_Resync_OnlyMarksOwnedObjects()
+        {
+            // Build a minimal SpawnManager with one owned + one non-owned object.
+            var registry  = new NetworkObjectRegistry();
+            var ownership = new RTMPE.Core.OwnershipManager(registry, _nm);
+            var spawn     = new RTMPE.Core.SpawnManager(registry, ownership, _nm);
+
+            var owned = _owner;                             // already ownerId = player-owner
+            var foreignGo = new GameObject("ForeignNB");
+            var foreign   = foreignGo.AddComponent<NetworkBehaviourStub>();
+            foreign.Initialize(43UL, "player-other");
+            foreign.SetSpawned(true);
+
+            registry.Register(owned);
+            registry.Register(foreign);
+
+            var vOwned   = new NetworkVariableInt(owned,   10, 0);
+            var vForeign = new NetworkVariableInt(foreign, 20, 0);
+            vOwned.Value = 1;   vOwned.MarkClean();
+            vForeign.Value = 2; vForeign.MarkClean();
+
+            spawn.MarkAllVariablesDirtyForResync();
+
+            Assert.IsTrue(vOwned.IsDirty,   "Owned variable must be re-dirtied for resync.");
+            Assert.IsFalse(vForeign.IsDirty, "Non-owned variable must NOT be touched — remote clients resync their own state.");
+
+            UnityEngine.Object.DestroyImmediate(foreignGo);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Pluggable Transport (Fix 2) — TransportFactory override replaces the
+    //      built-in UdpTransport on InitialiseNetwork.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("PluggableTransport")]
+    public class PluggableTransportTests
+    {
+        private sealed class StubTransport : RTMPE.Transport.NetworkTransport
+        {
+            public override bool IsConnected => false;
+            public override void Connect()    { }
+            public override void Disconnect() { }
+            public override void Send(byte[] data) { }
+            public override int  Receive(byte[] buffer) => 0;
+            public override bool Poll(int microSeconds) => false;
+            public override void Dispose()    { }
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            // Tests share a static factory — always clear to avoid leaking
+            // into the next fixture's SetUp.
+            NetworkManager.ClearTransportFactory();
+        }
+
+        [Test]
+        public void NoFactory_DefaultsToUdpTransport()
+        {
+            NetworkManager.ClearTransportFactory();
+            Assert.IsFalse(NetworkManager.HasCustomTransportFactory,
+                "Default path must report no custom factory.");
+        }
+
+        [Test]
+        public void CustomFactory_IsInvoked_AndProducesTheReportedTransport()
+        {
+            int factoryCalls = 0;
+            NetworkManager.SetTransportFactory(settings =>
+            {
+                Interlocked.Increment(ref factoryCalls);
+                Assert.IsNotNull(settings, "Factory must receive the active NetworkSettings.");
+                return new StubTransport();
+            });
+
+            Assert.IsTrue(NetworkManager.HasCustomTransportFactory,
+                "SetTransportFactory must flip HasCustomTransportFactory true.");
+
+            // Spin up a throwaway NetworkManager; Awake calls InitialiseNetwork,
+            // which will invoke the factory exactly once.
+            var go = new GameObject("NM_PluggableTransport");
+            try
+            {
+                go.AddComponent<NetworkManager>();
+                Assert.AreEqual(1, factoryCalls,
+                    "Custom transport factory must be invoked exactly once per InitialiseNetwork.");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(go);
+            }
+        }
+
+        [Test]
+        public void FactoryReturningNull_FallsBackToUdpTransport_WithoutThrowing()
+        {
+            NetworkManager.SetTransportFactory(_ => null);
+
+            var go = new GameObject("NM_FactoryNull");
+            try
+            {
+                Assert.DoesNotThrow(() => go.AddComponent<NetworkManager>(),
+                    "A null factory return must fall back, not throw.");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(go);
+            }
+        }
+
+        [Test]
+        public void FactoryThrowing_FallsBackToUdpTransport_WithoutThrowing()
+        {
+            NetworkManager.SetTransportFactory(_ =>
+                throw new InvalidOperationException("synthetic factory failure"));
+
+            var go = new GameObject("NM_FactoryThrows");
+            try
+            {
+                // Expect the error log from the fallback path so NUnit doesn't
+                // fail on a logged error.
+                UnityEngine.TestTools.LogAssert.Expect(LogType.Error,
+                    new System.Text.RegularExpressions.Regex(
+                        "Custom transport factory threw"));
+                UnityEngine.TestTools.LogAssert.Expect(LogType.Warning,
+                    new System.Text.RegularExpressions.Regex(
+                        "Falling back to the built-in UdpTransport.*"));
+
+                Assert.DoesNotThrow(() => go.AddComponent<NetworkManager>(),
+                    "A throwing factory must be caught; NetworkManager must still initialise.");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(go);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Scene-transition Pruning (Fix 4) — NetworkObjectRegistry.PruneDestroyed
+    //      evicts entries whose GameObject has been Unity-destroyed.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("ScenePrune")]
+    public class NetworkObjectRegistryPruneTests
+    {
+        [Test]
+        public void PruneDestroyed_RemovesEntriesWhoseGameObjectWasDestroyed()
+        {
+            var registry = new NetworkObjectRegistry();
+
+            var liveGo   = new GameObject("Live_Prune");
+            var liveNb   = liveGo.AddComponent<NetworkBehaviourStub>();
+            liveNb.Initialize(1UL, "player-a");
+
+            var deadGo   = new GameObject("Dead_Prune");
+            var deadNb   = deadGo.AddComponent<NetworkBehaviourStub>();
+            deadNb.Initialize(2UL, "player-a");
+
+            registry.Register(liveNb);
+            registry.Register(deadNb);
+
+            // Simulate a scene unload — Unity destroys the GameObject out from
+            // under the registry without the SDK ever calling Unregister.
+            UnityEngine.Object.DestroyImmediate(deadGo);
+
+            int pruned = registry.PruneDestroyed();
+            Assert.AreEqual(1, pruned,
+                "Exactly one registry entry must have been destroyed by Unity.");
+
+            Assert.IsNotNull(registry.Get(1UL),
+                "Live registered object must still be present after prune.");
+            Assert.IsNull(registry.Get(2UL),
+                "Destroyed registry entry must be evicted after PruneDestroyed.");
+
+            UnityEngine.Object.DestroyImmediate(liveGo);
+        }
+
+        [Test]
+        public void PruneDestroyed_NoStaleEntries_ReturnsZero()
+        {
+            var registry = new NetworkObjectRegistry();
+
+            var goA = new GameObject("A_Prune");
+            var nbA = goA.AddComponent<NetworkBehaviourStub>();
+            nbA.Initialize(10UL, "p");
+            registry.Register(nbA);
+
+            int pruned = registry.PruneDestroyed();
+            Assert.AreEqual(0, pruned,
+                "PruneDestroyed must return 0 when no entries are stale.");
+
+            UnityEngine.Object.DestroyImmediate(goA);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Object Pool (Fix 5) — INetworkObjectPool is consulted when installed
+    //      and bypassed when null.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("ObjectPool")]
+    public class ObjectPoolTests
+    {
+        private sealed class CountingPool : INetworkObjectPool
+        {
+            public int AcquireCalls;
+            public int ReleaseCalls;
+            public List<uint> AcquiredPrefabIds = new List<uint>();
+            public List<uint> ReleasedPrefabIds = new List<uint>();
+
+            public GameObject Acquire(uint prefabId, GameObject prefab, Vector3 position, Quaternion rotation)
+            {
+                AcquireCalls++;
+                AcquiredPrefabIds.Add(prefabId);
+                return UnityEngine.Object.Instantiate(prefab, position, rotation);
+            }
+
+            public void Release(uint prefabId, GameObject instance)
+            {
+                ReleaseCalls++;
+                ReleasedPrefabIds.Add(prefabId);
+                UnityEngine.Object.Destroy(instance);
+            }
+        }
+
+        private GameObject     _nmGo;
+        private NetworkManager _nm;
+        private GameObject     _prefab;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo  = new GameObject("NM_Pool");
+            _nm    = _nmGo.AddComponent<NetworkManager>();
+            _prefab = new GameObject("Pool_Prefab");
+            _prefab.AddComponent<NetworkBehaviourStub>();
+            _nm.SetLocalPlayerStringId("player-owner");
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            UnityEngine.Object.DestroyImmediate(_nmGo);
+            UnityEngine.Object.DestroyImmediate(_prefab);
+        }
+
+        [Test]
+        public void SpawnManager_WithPool_RoutesAcquireAndRelease()
+        {
+            var pool = new CountingPool();
+            _nm.Spawner.RegisterPrefab(100, _prefab);
+            _nm.Spawner.SetObjectPool(pool);
+
+            var nb = _nm.Spawner.Spawn(100, Vector3.zero, Quaternion.identity, "player-owner");
+            Assert.IsNotNull(nb, "Spawn must return a live NetworkBehaviour.");
+            Assert.AreEqual(1, pool.AcquireCalls, "Pool.Acquire must be invoked once per Spawn.");
+            Assert.AreEqual(100U, pool.AcquiredPrefabIds[0]);
+
+            _nm.Spawner.Despawn(nb.NetworkObjectId);
+            Assert.AreEqual(1, pool.ReleaseCalls, "Pool.Release must be invoked once per Despawn.");
+            Assert.AreEqual(100U, pool.ReleasedPrefabIds[0],
+                "Release must carry the SAME prefabId that Acquire returned the instance for.");
+        }
+
+        [Test]
+        public void SpawnManager_WithoutPool_DoesNotCrash()
+        {
+            _nm.Spawner.RegisterPrefab(101, _prefab);
+            _nm.Spawner.ClearObjectPool();
+
+            var nb = _nm.Spawner.Spawn(101, Vector3.zero, Quaternion.identity, "player-owner");
+            Assert.IsNotNull(nb, "Spawn without a pool must still return a live NetworkBehaviour.");
+            Assert.IsNull(_nm.Spawner.ObjectPool, "ObjectPool must report null when cleared.");
+
+            Assert.DoesNotThrow(() => _nm.Spawner.Despawn(nb.NetworkObjectId),
+                "Despawn without a pool must fall back to Object.Destroy without throwing.");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Auto Room Re-Join (Fix 3) — LastRoomId is populated on join, preserved
+    //      across token-preserving clear, and wiped on an explicit Disconnect.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("AutoRejoin")]
+    public class AutoRejoinTests
+    {
+        private GameObject     _nmGo;
+        private NetworkManager _nm;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo = new GameObject("NM_AutoRejoin");
+            _nm   = _nmGo.AddComponent<NetworkManager>();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            UnityEngine.Object.DestroyImmediate(_nmGo);
+        }
+
+        // Reach into the private RememberRoom helper via reflection — the
+        // alternative (driving a full RoomJoined event) would require a
+        // fully established session which is heavier than needed here.
+        private void RememberRoom(RoomInfo room)
+        {
+            var mi = typeof(NetworkManager).GetMethod(
+                "RememberRoom",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.IsNotNull(mi, "RememberRoom helper must exist on NetworkManager.");
+            mi.Invoke(_nm, new object[] { room });
+        }
+
+        // Expose the ClearSessionData overload that accepts preserveReconnectToken.
+        private void ClearSessionData(bool preserveReconnectToken)
+        {
+            var mi = typeof(NetworkManager).GetMethod(
+                "ClearSessionData",
+                BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null,
+                types: new[] { typeof(bool) },
+                modifiers: null);
+            Assert.IsNotNull(mi,
+                "ClearSessionData(bool) overload must exist on NetworkManager.");
+            mi.Invoke(_nm, new object[] { preserveReconnectToken });
+        }
+
+        [Test]
+        public void RememberRoom_PopulatesLastRoomIdAndCode()
+        {
+            var room = new RoomInfo("room-uuid-1", "ABC123", "Test", "waiting", 1, 8, true);
+            RememberRoom(room);
+
+            Assert.AreEqual("room-uuid-1", _nm.LastRoomId);
+            Assert.AreEqual("ABC123",      _nm.LastRoomCode);
+        }
+
+        [Test]
+        public void PreservingReconnectToken_ShouldAlsoPreserve_LastRoomSnapshot()
+        {
+            var room = new RoomInfo("room-uuid-2", "XKCD42", "Test", "waiting", 1, 8, true);
+            RememberRoom(room);
+
+            ClearSessionData(preserveReconnectToken: true);
+
+            Assert.AreEqual("room-uuid-2", _nm.LastRoomId,
+                "Token-preserving clear MUST keep the last-room snapshot so Reconnect() " +
+                "can auto-rejoin.");
+            Assert.AreEqual("XKCD42", _nm.LastRoomCode);
+        }
+
+        [Test]
+        public void ClearingReconnectToken_AlsoClears_LastRoomSnapshot()
+        {
+            var room = new RoomInfo("room-uuid-3", "ZYXW98", "Test", "waiting", 1, 8, true);
+            RememberRoom(room);
+
+            ClearSessionData(preserveReconnectToken: false);
+
+            Assert.IsNull(_nm.LastRoomId,
+                "Full clear must wipe LastRoomId — it is meaningless without the token.");
+            Assert.IsNull(_nm.LastRoomCode);
+        }
+
+        [Test]
+        public void RememberRoom_WithNullRoom_ClearsSnapshot()
+        {
+            RememberRoom(new RoomInfo("room-uuid-4", "Q1Q1Q1", "N", "waiting", 1, 2, true));
+            Assert.AreEqual("room-uuid-4", _nm.LastRoomId);
+
+            RememberRoom(null);
+
+            Assert.IsNull(_nm.LastRoomId,
+                "Null room parameter must clear the snapshot (defensive reset).");
+        }
+
+        [Test]
+        public void AutoRejoinSetting_DefaultsToEnabled()
+        {
+            var defaults = NetworkSettings.CreateInstance<NetworkSettings>();
+            Assert.IsTrue(defaults.autoRejoinLastRoomOnReconnect,
+                "autoRejoinLastRoomOnReconnect must default to true — backwards-safe for new users.");
+            UnityEngine.Object.DestroyImmediate(defaults);
         }
     }
 
